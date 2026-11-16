@@ -11,6 +11,7 @@ import (
 
 	"github.com/sinsuki/guardrail-proxy/internal/approval"
 	"github.com/sinsuki/guardrail-proxy/internal/config"
+	"github.com/sinsuki/guardrail-proxy/internal/llm"
 	"github.com/sinsuki/guardrail-proxy/internal/proxy"
 )
 
@@ -21,6 +22,7 @@ func main() {
 	approvalWebhook := flag.String("approval-webhook", "", "absolute http(s) URL that decides needs_approval calls")
 	approvalSecret := flag.String("approval-secret", "", "HMAC secret for the approval webhook; overrides GUARDRAIL_APPROVAL_SECRET")
 	approvalTimeout := flag.Duration("approval-timeout", 5*time.Second, "how long to wait for an approval before denying")
+	llmURL := flag.String("llm", "", "absolute http(s) URL for POST /v1/llm; prompts are redacted before they are forwarded")
 	flag.Parse()
 
 	if *upstream == "" {
@@ -54,14 +56,29 @@ func main() {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}
+	root := handler.Handler()
+	if *llmURL != "" {
+		lp, err := llm.New(*llmURL, nil)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
+		mux := http.NewServeMux()
+		mux.Handle("POST /v1/llm", lp.Handler())
+		mux.Handle("/", root)
+		root = mux
+	}
 
 	writeTimeout := 30 * time.Second
 	if *approvalTimeout+20*time.Second > writeTimeout {
 		writeTimeout = *approvalTimeout + 20*time.Second
 	}
+	if *llmURL != "" && writeTimeout < 90*time.Second {
+		writeTimeout = 90 * time.Second
+	}
 	srv := &http.Server{
 		Addr:              *listen,
-		Handler:           handler.Handler(),
+		Handler:           root,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      writeTimeout,
