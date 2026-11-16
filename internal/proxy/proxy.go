@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"time"
 
+	"github.com/sinsuki/guardrail-proxy/internal/approval"
 	"github.com/sinsuki/guardrail-proxy/internal/check"
 	"github.com/sinsuki/guardrail-proxy/internal/config"
 	"github.com/sinsuki/guardrail-proxy/internal/rules"
@@ -27,16 +28,31 @@ const (
 // Schema rejections do not set it; those responses carry an error object.
 const HeaderDecision = "X-Guardrail-Decision"
 
+// HeaderRequestID is the approval request id, set when a webhook was asked.
+const HeaderRequestID = "X-Guardrail-Request-Id"
+
 // Proxy checks tool calls and forwards the ones the policy allows.
 // The upstream URL comes from the operator, not from the request.
 type Proxy struct {
 	checker  *check.Checker
 	upstream *url.URL
 	client   *http.Client
+	approval *approval.Client
+}
+
+// Option configures optional proxy behavior.
+type Option func(*Proxy)
+
+// WithApproval asks this webhook before forwarding a needs_approval call.
+// Without it, needs_approval is not forwarded.
+func WithApproval(c *approval.Client) Option {
+	return func(p *Proxy) {
+		p.approval = c
+	}
 }
 
 // New builds a proxy. client may be nil, in which case a client with a 10s timeout is used.
-func New(policy config.Policy, upstream string, client *http.Client) (*Proxy, error) {
+func New(policy config.Policy, upstream string, client *http.Client, opts ...Option) (*Proxy, error) {
 	u, err := url.Parse(upstream)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return nil, fmt.Errorf("upstream must be an absolute http or https URL")
@@ -44,11 +60,15 @@ func New(policy config.Policy, upstream string, client *http.Client) (*Proxy, er
 	if client == nil {
 		client = &http.Client{Timeout: 10 * time.Second}
 	}
-	return &Proxy{
+	p := &Proxy{
 		checker:  check.New(policy),
 		upstream: u,
 		client:   client,
-	}, nil
+	}
+	for _, opt := range opts {
+		opt(p)
+	}
+	return p, nil
 }
 
 // Handler serves POST /v1/tool-calls and GET /healthz.
@@ -93,10 +113,9 @@ func (p *Proxy) handleToolCall(w http.ResponseWriter, r *http.Request) {
 	switch result.Decision {
 	case rules.Allow:
 		p.forward(w, r, body, result)
-	case rules.Deny, rules.NeedsApproval:
-		// needs_approval is not executed in this milestone. A later milestone
-		// can hold the call and wait for an approval webhook. The decision
-		// stays needs_approval so a hard deny and a missing approval are distinct.
+	case rules.NeedsApproval:
+		p.handleApproval(w, r, body, result)
+	case rules.Deny:
 		log.Printf("decision tool=%s decision=%s rule=%s forwarded=false", result.Tool, result.Decision, result.RuleID)
 		w.Header().Set(HeaderDecision, string(result.Decision))
 		writeJSON(w, http.StatusForbidden, decisionResponse{
@@ -109,6 +128,40 @@ func (p *Proxy) handleToolCall(w http.ResponseWriter, r *http.Request) {
 		log.Printf("unexpected decision %q", result.Decision)
 		writeError(w, http.StatusInternalServerError, "internal error")
 	}
+}
+
+func (p *Proxy) handleApproval(w http.ResponseWriter, r *http.Request, body []byte, result rules.Result) {
+	if p.approval == nil {
+		// No webhook is configured, so the call cannot be approved.
+		log.Printf("decision tool=%s decision=%s rule=%s forwarded=false", result.Tool, result.Decision, result.RuleID)
+		w.Header().Set(HeaderDecision, string(result.Decision))
+		writeJSON(w, http.StatusForbidden, decisionResponse{
+			Decision:  result.Decision,
+			Reason:    result.Reason,
+			RuleID:    result.RuleID,
+			Forwarded: false,
+		})
+		return
+	}
+
+	outcome := p.approval.Ask(r.Context(), body, result.RuleID, result.Reason)
+	if outcome.RequestID != "" {
+		w.Header().Set(HeaderRequestID, outcome.RequestID)
+	}
+	if !outcome.Approved {
+		log.Printf("approval request_id=%s tool=%s approved=false reason=%s", outcome.RequestID, result.Tool, outcome.Reason)
+		w.Header().Set(HeaderDecision, string(rules.Deny))
+		writeJSON(w, http.StatusForbidden, decisionResponse{
+			Decision:  rules.Deny,
+			Reason:    outcome.Reason,
+			RuleID:    result.RuleID,
+			RequestID: outcome.RequestID,
+			Forwarded: false,
+		})
+		return
+	}
+	log.Printf("approval request_id=%s tool=%s approved=true", outcome.RequestID, result.Tool)
+	p.forward(w, r, body, result)
 }
 
 func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, result rules.Result) {
@@ -149,7 +202,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, res
 	w.Header().Set(HeaderDecision, string(rules.Allow))
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(upstreamBody)
-	log.Printf("decision tool=%s decision=%s forwarded=true upstream_status=%d", result.Tool, result.Decision, resp.StatusCode)
+	log.Printf("decision tool=%s decision=%s forwarded=true upstream_status=%d", result.Tool, rules.Allow, resp.StatusCode)
 }
 
 func readBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
@@ -162,6 +215,7 @@ type decisionResponse struct {
 	Decision  rules.Decision `json:"decision"`
 	Reason    string         `json:"reason"`
 	RuleID    string         `json:"rule_id,omitempty"`
+	RequestID string         `json:"request_id,omitempty"`
 	Forwarded bool           `json:"forwarded"`
 }
 
