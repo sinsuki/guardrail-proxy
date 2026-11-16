@@ -1,0 +1,9 @@
+.PHONY: test demo
+
+test:
+	go test ./...
+	go vet ./...
+	go test -race ./...
+
+demo:
+	go run ./cmd/demo
