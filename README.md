@@ -4,7 +4,7 @@ Deterministic guardrail for financial AI agents. An agent sends a tool call as J
 
 The calls in view are ones that move money, read a balance, or change a stored record. The proxy does not authenticate the caller and does not replace the upstream API's own authorization. It stops malformed calls, and it applies the rules in the policy file, before anything is forwarded.
 
-This tree has the schema, the rule engine, and a human approval webhook. Later milestones add PII redaction, a signed hash-chained audit log, and a demo agent.
+This tree has the schema, the rule engine, a human approval webhook, and PII redaction on the path to an LLM. Later milestones add a signed hash-chained audit log and a demo agent.
 
 ## Policy
 
@@ -26,6 +26,24 @@ When `-approval-webhook` is set, a `needs_approval` call is posted to that URL a
 The shared secret is `GUARDRAIL_APPROVAL_SECRET` or `-approval-secret`. It is not stored in `policy.json`. It must be at least 16 bytes. Each side signs the raw JSON body with HMAC-SHA256 (`X-Guardrail-Signature: v1=...`). The signed decision includes the request id and the SHA-256 of the exact tool-call bytes, so an approval for one amount cannot be applied to another. The request id is single-use. The proxy stops waiting after `-approval-timeout` (default 5s) and denies the call.
 
 The proxy holds the agent request open while the webhook decides. Closing that connection denies the call. Without `-approval-webhook`, `needs_approval` is still not forwarded.
+
+## PII redaction
+
+`POST /v1/llm` redacts a prompt, forwards it to the `-llm` URL, and puts the originals back in the reply. The mapping lives only for that request. It is not written to the LLM, to logs, or to the financial API. Tool calls to the bank still carry real account numbers, because the bank has to see them.
+
+Each value becomes a stable placeholder such as `[EMAIL_1]`. The same email twice in one prompt shares one placeholder, so the model can refer to it and the proxy can fill it back in, including inside a tool call in the reply.
+
+The matcher looks for:
+
+- email addresses
+- US phone numbers that include separators, a leading `+`, or a phone label, and E.164 numbers
+- SSNs written as `ddd-dd-dddd` or `ddd dd dddd`, excluding the well-known invalid ranges
+- card numbers of 13 to 19 digits that pass the Luhn check, with spaces or dashes allowed
+- US routing numbers that pass the ABA checksum and prefix ranges
+- account numbers of 6 to 17 digits that sit next to a word like `account`, `checking`, or `savings`
+- IBANs that pass the mod-97 check
+
+It does not try to find names or street addresses. Those are not regular enough, and a name list would both miss people and flag ordinary words. It also misses obfuscation (`ada at example dot com`), a phone number written as ten digits with no label or separators, and an account number with no nearby label. A 16-digit order id that happens to pass Luhn, or a 9-digit id that happens to pass the ABA check, can still be flagged. That is the limit of this kind of scan.
 
 ## Run
 
@@ -61,7 +79,25 @@ curl -sS -D- http://127.0.0.1:8080/v1/tool-calls \
   -d '{"tool":"transfer","arguments":{"from_account":"acct_1","to_account":"acct_2","amount_cents":50001,"currency":"USD"}}'
 ```
 
-`-decision deny` makes the same call return 403 and skips the upstream. `GET /healthz` returns `ok`. Request bodies are limited to 64 KiB. The upstream URL and the webhook URL come from flags; the request cannot choose them.
+`-decision deny` makes the same call return 403 and skips the upstream. `GET /healthz` returns `ok`. Tool-call bodies are limited to 64 KiB. LLM bodies are limited to 1 MiB. The upstream URL, the webhook URL, and the LLM URL come from flags; the request cannot choose them.
+
+To redact prompts, start a stand-in model and pass `-llm`:
+
+```bash
+go run ./cmd/fakellm -listen 127.0.0.1:8083
+go run ./cmd/proxy -config policy.json \
+  -upstream http://127.0.0.1:8081/ \
+  -llm http://127.0.0.1:8083/ \
+  -listen 127.0.0.1:8080
+```
+
+```bash
+curl -sS -D- http://127.0.0.1:8080/v1/llm \
+  -H 'content-type: application/json' \
+  -d '{"messages":[{"role":"user","content":"email ada@example.com about the transfer"}]}'
+```
+
+The model sees `[EMAIL_1]`. The curl response has `ada@example.com` again. `X-Guardrail-Redacted` counts kinds, not values.
 
 ## Tests
 
@@ -69,7 +105,7 @@ curl -sS -D- http://127.0.0.1:8080/v1/tool-calls \
 go test ./...
 go vet ./...
 go test -race ./...
-go test ./internal/check ./internal/approval ./internal/proxy -bench=. -benchmem
+go test ./internal/check ./internal/approval ./internal/proxy ./internal/redact -bench=. -benchmem
 ```
 
 ## Layout
@@ -79,9 +115,12 @@ go test ./internal/check ./internal/approval ./internal/proxy -bench=. -benchmem
 - `internal/config` loads the policy file.
 - `internal/check` runs the schema check, then the rules.
 - `internal/approval` signs and checks one webhook decision.
-- `internal/proxy` is the HTTP endpoint.
+- `internal/proxy` is the tool-call HTTP endpoint.
+- `internal/redact` replaces PII with placeholders and restores them.
+- `internal/llm` redacts a prompt, forwards it, and restores the reply.
 - `internal/fakeupstream` is the stand-in API.
 - `internal/fakeapprover` is the stand-in webhook.
+- `internal/fakellm` is the stand-in model.
 
 ## License
 
