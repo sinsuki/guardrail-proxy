@@ -1,120 +1,74 @@
 # guardrail-proxy
 
-Deterministic guardrail for financial AI agents. An agent sends a tool call as JSON (a tool name and its arguments). This proxy checks the call against a strict schema and a business-rule file, then forwards it only when the rules allow it.
+guardrail-proxy sits in front of a financial AI agent and decides what is allowed to happen. Tool calls that move money, read a balance, or change a record are checked against a strict schema and a deterministic rule file before they reach the API. Transfers over $500 wait for a signed human approval. Prompts are scrubbed of card numbers, account numbers, and other pattern-matched PII before they reach a model, and the originals are put back only in the reply. Every one of those steps is an append-only, Ed25519-signed hash chain, so a later edit to the log is visible.
 
-The calls in view are ones that move money, read a balance, or change a stored record. The proxy does not authenticate the caller and does not replace the upstream API's own authorization. It stops malformed calls, and it applies the rules in the policy file, before anything is forwarded.
+## Architecture
 
-This tree has the schema, the rule engine, a human approval webhook, PII redaction on the path to an LLM, and a signed hash-chained audit log. A later milestone adds a demo agent.
-
-## Policy
-
-`policy.json` is a working sample. Integer fields are base-10 JSON integers in the int64 range. `500.00`, `1e2`, and `"50000"` are rejected. Integers are read from the JSON text, so a value past the float64 mantissa stays exact. Money is integer cents: one dollar is `100`, and five hundred dollars is `50000`.
-
-Rules run in file order. The first match wins. If none match, the decision is `allow`. Integer fields accept `eq`, `ne`, `lt`, `lte`, `gt`, and `gte`. String and boolean fields accept `eq` and `ne`. A rule can only name a required field.
-
-The sample has two transfer rules:
-
-- `amount_cents < 1` is `deny`. Zero and negative amounts are denied, including a negative whose magnitude is over $500.
-- `amount_cents > 50000` is `needs_approval`. That is anything over $500.00.
-
-A transfer of exactly `50000` cents is allowed. The sample rule does not read the currency code and does not convert currencies.
-
-## Approval
-
-When `-approval-webhook` is set, a `needs_approval` call is posted to that URL and the proxy waits. The webhook returns `approve` or `deny`. Only `approve` is forwarded. A timeout, a bad signature, a mismatched call, or a reused decision is a denial and is not forwarded.
-
-The shared secret is `GUARDRAIL_APPROVAL_SECRET` or `-approval-secret`. It is not stored in `policy.json`. It must be at least 16 bytes. Each side signs the raw JSON body with HMAC-SHA256 (`X-Guardrail-Signature: v1=...`). The signed decision includes the request id and the SHA-256 of the exact tool-call bytes, so an approval for one amount cannot be applied to another. The request id is single-use. The proxy stops waiting after `-approval-timeout` (default 5s) and denies the call.
-
-The proxy holds the agent request open while the webhook decides. Closing that connection denies the call. Without `-approval-webhook`, `needs_approval` is still not forwarded.
-
-## PII redaction
-
-`POST /v1/llm` redacts a prompt, forwards it to the `-llm` URL, and puts the originals back in the reply. The mapping lives only for that request. It is not written to the LLM, to logs, or to the financial API. Tool calls to the bank still carry real account numbers, because the bank has to see them.
-
-Each value becomes a stable placeholder such as `[EMAIL_1]`. The same email twice in one prompt shares one placeholder, so the model can refer to it and the proxy can fill it back in, including inside a tool call in the reply.
-
-The matcher looks for:
-
-- email addresses
-- US phone numbers that include separators, a leading `+`, or a phone label, and E.164 numbers
-- SSNs written as `ddd-dd-dddd` or `ddd dd dddd`, excluding the well-known invalid ranges
-- card numbers of 13 to 19 digits that pass the Luhn check, with spaces or dashes allowed
-- US routing numbers that pass the ABA checksum and prefix ranges
-- account numbers of 6 to 17 digits that sit next to a word like `account`, `checking`, or `savings`
-- IBANs that pass the mod-97 check
-
-It does not try to find names or street addresses. Those are not regular enough, and a name list would both miss people and flag ordinary words. It also misses obfuscation (`ada at example dot com`), a phone number written as ten digits with no label or separators, and an account number with no nearby label. A 16-digit order id that happens to pass Luhn, or a 9-digit id that happens to pass the ABA check, can still be flagged. That is the limit of this kind of scan.
-
-## Run
-
-From the repo root, start the stand-in API and the proxy:
-
-```bash
-go run ./cmd/fakeupstream -listen 127.0.0.1:8081
-go run ./cmd/proxy -config policy.json -upstream http://127.0.0.1:8081/ -listen 127.0.0.1:8080
+```mermaid
+flowchart TD
+  agent[Demo agent] -->|tool call or prompt| proxy[Proxy]
+  proxy --> rules[Schema and rules]
+  rules -->|allow| bank[Financial API]
+  rules -->|needs approval| human[Approval webhook]
+  human -->|signed approve| bank
+  human -->|deny or timeout| agent
+  rules -->|deny or invalid| agent
+  proxy -->|redact strings| model[LLM]
+  model -->|reply| proxy
+  proxy -->|restore placeholders| agent
+  proxy --> log[Audit log]
+  log --> verify[audit verify]
 ```
 
-Exactly $500.00 is allowed without a webhook. The upstream body is returned as-is, with `X-Guardrail-Decision: allow`:
+The default demo never leaves the machine. `cmd/demo` starts a stand-in bank, a stand-in approver, and a stand-in model, then plays one scenario through the real proxy.
+
+## Quickstart
+
+From the repo root:
 
 ```bash
-curl -sS -D- http://127.0.0.1:8080/v1/tool-calls \
-  -H 'content-type: application/json' \
-  -d '{"tool":"transfer","arguments":{"from_account":"acct_1","to_account":"acct_2","amount_cents":50000,"currency":"USD"}}'
+go run ./cmd/demo
 ```
 
-For a transfer over $500.00, stop that proxy and start an approver. The secret below is a local development value.
+`make demo` does the same thing. The first run compiles the packages. No API key is required. A built `./cmd/demo`, timed with bash `time` on this machine after `go build`, finished in 0.027s and then 0.019s of real time. That does not include compilation.
+
+The walkthrough reads a balance, sends a $200 transfer, sends a $750 transfer once with the approver set to approve and once with it set to deny, rejects a float amount, sends a prompt containing an email address and shows it restored, runs `audit verify`, then flips one byte and shows verify stopping on that line.
+
+To send the prompt step to a real OpenAI-compatible endpoint instead of the stand-in:
 
 ```bash
-export GUARDRAIL_APPROVAL_SECRET=dev-approval-secret
-go run ./cmd/fakeapprover -listen 127.0.0.1:8082 -decision approve
-go run ./cmd/proxy -config policy.json \
-  -upstream http://127.0.0.1:8081/ \
-  -approval-webhook http://127.0.0.1:8082/ \
-  -listen 127.0.0.1:8080
+go run ./cmd/demo -llm https://api.openai.com/v1/chat/completions -llm-model gpt-4o-mini
 ```
 
-```bash
-curl -sS -D- http://127.0.0.1:8080/v1/tool-calls \
-  -H 'content-type: application/json' \
-  -d '{"tool":"transfer","arguments":{"from_account":"acct_1","to_account":"acct_2","amount_cents":50001,"currency":"USD"}}'
-```
+The bearer token is `OPENAI_API_KEY` or `-llm-key`. It is forwarded to the model and is not printed.
 
-`-decision deny` makes the same call return 403 and skips the upstream. `GET /healthz` returns `ok`. Tool-call bodies are limited to 64 KiB. LLM bodies are limited to 1 MiB. The upstream URL, the webhook URL, and the LLM URL come from flags; the request cannot choose them.
+To run the pieces yourself, the flags are `-upstream`, `-approval-webhook`, `-approval-secret` or `GUARDRAIL_APPROVAL_SECRET`, `-llm`, `-audit-log`, and `-audit-key`. `go run ./cmd/audit keygen -out audit.key` writes the private key and `audit.pub`. Do not commit the private key.
 
-To redact prompts, start a stand-in model and pass `-llm`:
+## Threat model and limits
 
-```bash
-go run ./cmd/fakellm -listen 127.0.0.1:8083
-go run ./cmd/proxy -config policy.json \
-  -upstream http://127.0.0.1:8081/ \
-  -llm http://127.0.0.1:8083/ \
-  -listen 127.0.0.1:8080
-```
+The agent is untrusted. The proxy is the boundary in front of the bank and the model. It rejects malformed tool calls, blocks transfers the rules deny, holds transfers over $500 until a signed approval comes back, strips pattern-matched PII from prompts, and records the decisions in a log that detects edits.
 
-```bash
-curl -sS -D- http://127.0.0.1:8080/v1/llm \
-  -H 'content-type: application/json' \
-  -d '{"messages":[{"role":"user","content":"email ada@example.com about the transfer"}]}'
-```
+It does not authenticate the caller, and it does not replace the bank's own authorization. The sample $500 rule compares `amount_cents` with 50000. It does not convert currencies. Approval is a synchronous webhook call. If the approver is down or slow, the proxy denies the call after the timeout. A person who holds the audit private key can rewrite the chain. The key is what the signatures depend on.
 
-The model sees `[EMAIL_1]`. The curl response has `ada@example.com` again. `X-Guardrail-Redacted` counts kinds, not values.
+PII detection is pattern matching. It catches emails, formatted and E.164 phone numbers, dashed or spaced SSNs outside the invalid ranges, card numbers of 13 to 19 digits that pass the Luhn check, ABA routing numbers, account numbers written next to a label such as `account` or `checking`, and IBANs that pass the mod-97 check. It does not catch names or street addresses. It misses obfuscated text (`ada at example dot com`), a bare ten-digit phone number, and an account number with no nearby label. A 16-digit order id that passes Luhn, or a 9-digit id that passes the ABA check, can still be flagged. Tool calls to the bank are not redacted. The bank has to see the account. The audit log stores a SHA-256 of the tool-call bytes and redaction counts by type. It does not store prompt text or the placeholder map.
 
-## Audit log
+## Measured numbers
 
-With `-audit-log` and `-audit-key`, every tool call, schema result, rule decision, approval request, approval answer, LLM redaction, and forward is an append-only JSON line. Each line stores the SHA-256 of the previous line and an Ed25519 signature over its own contents. Changing, deleting, reordering, or inserting a line breaks the chain. A signed tip file next to the log (`audit.jsonl.tip`) records the last sequence number, so chopping lines off the end is visible too.
+These are the benchmark runs from milestones 1–4, on Go 1.22.2, linux/amd64, Intel Xeon, `GOMAXPROCS` 4. They are the runs as recorded then, not a new measurement.
 
-The private key is created on the machine that writes the log. It is not part of this repo.
+| Milestone | Measurement | Runs (ns/op) | Median |
+|---|---|---|---|
+| 1 | One policy check, exactly $500.00 allowed | 6551, 6551, 6488, 6489, 6661 | 6551 ns/op; 5496 B/op; 115 allocs/op |
+| 1 | One policy check, $500.01 needs approval | 6403, 6436, 6440, 6416, 6406 | 6416 ns/op; 5496 B/op; 115 allocs/op |
+| 2 | Sign and check one approval, no network | 3656, 3666, 3689, 3749, 3770 | 3689 ns/op; 3128 B/op; 35 allocs/op |
+| 2 | Proxy allow, no webhook, localhost upstream | 52333, 50766, 51074, 50345, 51058 | 51058 ns/op; 222 allocs/op |
+| 2 | Proxy over $500 with an immediate approve | 162754, 163195, 163075, 162088, 161474 | 162754 ns/op; 405 allocs/op; 111696 ns more than the allow row |
+| 3 | Redact a 572-byte prompt | 100828, 101201, 100564, 101189, 101768 | 101189 ns/op; 54 allocs/op; 4101–4112 B/op |
+| 3 | Labeled corpus, 27 items | 12 PII strings caught, 25 strings kept | 0 false positives, 0 false negatives, 3 known misses |
+| 4 | Audit append, including fsync of the log and the tip | 545288, 466533, 446170, 475375, 472600 | 472600 ns/op; 80 allocs/op |
+| 4 | Verify a log of 10,000 entries | 421053507, 422611698, 419212258 | 421053507 ns, which is 421.05 ms |
 
-```bash
-go run ./cmd/audit keygen -out audit.key
-go run ./cmd/proxy -config policy.json \
-  -upstream http://127.0.0.1:8081/ \
-  -audit-log audit.jsonl -audit-key audit.key \
-  -listen 127.0.0.1:8080
-go run ./cmd/audit verify -log audit.jsonl -pub audit.pub
-```
-
-`verify` checks the chain with the public key and prints the first bad entry. Restarting the proxy resumes from the last signed line. Tool calls are stored as a SHA-256 of the raw body, not the body itself. LLM events store redaction counts by type and do not store the text or the placeholder map.
+Test counts when those milestones landed: 210, 234, 279, and 294 leaf tests. After the demo, `go test -json` reports 296 leaf tests across 58 test functions.
 
 ## Tests
 
@@ -122,23 +76,19 @@ go run ./cmd/audit verify -log audit.jsonl -pub audit.pub
 go test ./...
 go vet ./...
 go test -race ./...
-go test ./internal/check ./internal/approval ./internal/proxy ./internal/redact ./internal/audit -bench=. -benchmem
 ```
+
+GitHub Actions runs those three on push and pull request. `make test` runs them locally. The suite is 296 leaf tests.
 
 ## Layout
 
-- `internal/schema` validates one tool call.
-- `internal/rules` returns `allow`, `deny`, or `needs_approval`.
-- `internal/config` loads the policy file.
-- `internal/check` runs the schema check, then the rules.
-- `internal/approval` signs and checks one webhook decision.
-- `internal/proxy` is the tool-call HTTP endpoint.
-- `internal/redact` replaces PII with placeholders and restores them.
-- `internal/llm` redacts a prompt, forwards it, and restores the reply.
-- `internal/fakeupstream` is the stand-in API.
-- `internal/fakeapprover` is the stand-in webhook.
-- `internal/fakellm` is the stand-in model.
-- `internal/audit` is the hash-chained log. `cmd/audit` generates a key and verifies a log.
+- `cmd/demo` plays the scenario.
+- `cmd/proxy` is the server. `cmd/audit` generates a key and verifies a log.
+- `internal/schema` and `internal/rules` check one tool call.
+- `internal/approval` is the signed webhook round trip.
+- `internal/redact` and `internal/llm` redact a prompt and restore the reply.
+- `internal/audit` is the hash-chained log.
+- `internal/fakeupstream`, `internal/fakeapprover`, and `internal/fakellm` are the stand-ins.
 
 ## License
 

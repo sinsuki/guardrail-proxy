@@ -47,6 +47,16 @@ func New(secret, decision string) *Approver {
 	}
 }
 
+// SetDecision changes later answers to "approve" or "deny".
+func (a *Approver) SetDecision(decision string) {
+	if decision != string(approval.Approve) && decision != string(approval.Deny) {
+		return
+	}
+	a.mu.Lock()
+	a.decision = decision
+	a.mu.Unlock()
+}
+
 // SetDelay waits before answering. The wait stops if the client goes away.
 func (a *Approver) SetDelay(d time.Duration) {
 	a.mu.Lock()

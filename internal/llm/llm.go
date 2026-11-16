@@ -100,6 +100,9 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Header.Set("Content-Type", contentType)
+	if auth := r.Header.Get("Authorization"); auth != "" {
+		req.Header.Set("Authorization", auth)
+	}
 	resp, err := p.client.Do(req)
 	if err != nil {
 		log.Printf("llm error=%v", err)

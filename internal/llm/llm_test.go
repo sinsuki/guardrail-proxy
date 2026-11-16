@@ -152,6 +152,30 @@ func TestRedactionAuditOmitsValues(t *testing.T) {
 	}
 }
 
+func TestForwardsAuthorization(t *testing.T) {
+	var got string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	t.Cleanup(up.Close)
+	proxy, err := llm.New(up.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/llm", strings.NewReader(`{"prompt":"hello"}`))
+	req.Header.Set("Authorization", "Bearer secret-token")
+	proxy.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d %s", rec.Code, rec.Body.String())
+	}
+	if got != "Bearer secret-token" {
+		t.Fatalf("authorization %q", got)
+	}
+}
+
 func TestNewRejectsBadURL(t *testing.T) {
 	if _, err := llm.New("/relative", nil); err == nil {
 		t.Fatal("accepted relative url")
