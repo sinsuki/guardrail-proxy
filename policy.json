@@ -1,0 +1,48 @@
+{
+  "tools": {
+    "transfer": {
+      "description": "Move money from one account to another. amount_cents is an integer number of cents.",
+      "arguments": {
+        "from_account": {"type": "string", "required": true},
+        "to_account": {"type": "string", "required": true},
+        "amount_cents": {"type": "integer", "required": true},
+        "currency": {"type": "string", "required": true},
+        "memo": {"type": "string", "required": false}
+      }
+    },
+    "get_balance": {
+      "description": "Read the current balance of an account.",
+      "arguments": {
+        "account_id": {"type": "string", "required": true}
+      }
+    },
+    "update_record": {
+      "description": "Change one field on a stored financial record.",
+      "arguments": {
+        "record_id": {"type": "string", "required": true},
+        "field_name": {"type": "string", "required": true},
+        "value": {"type": "string", "required": true}
+      }
+    }
+  },
+  "rules": [
+    {
+      "id": "transfer_amount_must_be_positive",
+      "tool": "transfer",
+      "field": "amount_cents",
+      "op": "lt",
+      "value": 1,
+      "decision": "deny",
+      "reason": "transfer amount must be a positive number of cents"
+    },
+    {
+      "id": "transfer_over_500_needs_approval",
+      "tool": "transfer",
+      "field": "amount_cents",
+      "op": "gt",
+      "value": 50000,
+      "decision": "needs_approval",
+      "reason": "transfers over $500.00 need human approval"
+    }
+  ]
+}
