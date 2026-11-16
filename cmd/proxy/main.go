@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/sinsuki/guardrail-proxy/internal/approval"
+	"github.com/sinsuki/guardrail-proxy/internal/audit"
 	"github.com/sinsuki/guardrail-proxy/internal/config"
 	"github.com/sinsuki/guardrail-proxy/internal/llm"
 	"github.com/sinsuki/guardrail-proxy/internal/proxy"
@@ -23,6 +24,8 @@ func main() {
 	approvalSecret := flag.String("approval-secret", "", "HMAC secret for the approval webhook; overrides GUARDRAIL_APPROVAL_SECRET")
 	approvalTimeout := flag.Duration("approval-timeout", 5*time.Second, "how long to wait for an approval before denying")
 	llmURL := flag.String("llm", "", "absolute http(s) URL for POST /v1/llm; prompts are redacted before they are forwarded")
+	auditLog := flag.String("audit-log", "", "append-only audit log path")
+	auditKey := flag.String("audit-key", "", "hex Ed25519 private key file for the audit log")
 	flag.Parse()
 
 	if *upstream == "" {
@@ -37,7 +40,29 @@ func main() {
 		os.Exit(1)
 	}
 
+	var recorder *audit.Log
+	if *auditLog != "" || *auditKey != "" {
+		if *auditLog == "" || *auditKey == "" {
+			fmt.Fprintln(os.Stderr, "-audit-log and -audit-key must be set together")
+			os.Exit(2)
+		}
+		priv, err := audit.LoadPrivate(*auditKey)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
+		recorder, err = audit.Open(*auditLog, priv)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
+		defer recorder.Close()
+	}
+
 	var opts []proxy.Option
+	if recorder != nil {
+		opts = append(opts, proxy.WithAudit(recorder))
+	}
 	if *approvalWebhook != "" {
 		secret := *approvalSecret
 		if secret == "" {
@@ -58,7 +83,11 @@ func main() {
 	}
 	root := handler.Handler()
 	if *llmURL != "" {
-		lp, err := llm.New(*llmURL, nil)
+		var llmOpts []llm.Option
+		if recorder != nil {
+			llmOpts = append(llmOpts, llm.WithAudit(recorder))
+		}
+		lp, err := llm.New(*llmURL, nil, llmOpts...)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%v\n", err)
 			os.Exit(1)

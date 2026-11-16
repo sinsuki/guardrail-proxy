@@ -3,6 +3,8 @@ package proxy
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +15,7 @@ import (
 	"time"
 
 	"github.com/sinsuki/guardrail-proxy/internal/approval"
+	"github.com/sinsuki/guardrail-proxy/internal/audit"
 	"github.com/sinsuki/guardrail-proxy/internal/check"
 	"github.com/sinsuki/guardrail-proxy/internal/config"
 	"github.com/sinsuki/guardrail-proxy/internal/rules"
@@ -33,11 +36,17 @@ const HeaderRequestID = "X-Guardrail-Request-Id"
 
 // Proxy checks tool calls and forwards the ones the policy allows.
 // The upstream URL comes from the operator, not from the request.
+// Auditor records one audit event. A nil auditor records nothing.
+type Auditor interface {
+	Append(kind string, payload any) error
+}
+
 type Proxy struct {
 	checker  *check.Checker
 	upstream *url.URL
 	client   *http.Client
 	approval *approval.Client
+	audit    Auditor
 }
 
 // Option configures optional proxy behavior.
@@ -48,6 +57,13 @@ type Option func(*Proxy)
 func WithApproval(c *approval.Client) Option {
 	return func(p *Proxy) {
 		p.approval = c
+	}
+}
+
+// WithAudit records tool calls, decisions, approvals, and forwards.
+func WithAudit(a Auditor) Option {
+	return func(p *Proxy) {
+		p.audit = a
 	}
 }
 
@@ -97,16 +113,42 @@ func (p *Proxy) handleToolCall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := p.record(audit.KindToolCall, map[string]any{
+		"body_sha256": bodyHash(body),
+		"bytes":       len(body),
+	}); err != nil {
+		auditFailed(w)
+		return
+	}
+
 	result, err := p.checker.Check(body)
 	if err != nil {
 		var rejected *schema.Error
 		if errors.As(err, &rejected) {
 			log.Printf("rejected error=%s", rejected.Error())
+			if err := p.record(audit.KindSchema, map[string]any{"ok": false, "error": rejected.Error()}); err != nil {
+				auditFailed(w)
+				return
+			}
 			writeError(w, http.StatusBadRequest, rejected.Error())
 			return
 		}
 		log.Printf("check error=%v", err)
+		_ = p.record(audit.KindSchema, map[string]any{"ok": false, "error": "internal"})
 		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if err := p.record(audit.KindSchema, map[string]any{"ok": true, "tool": result.Tool}); err != nil {
+		auditFailed(w)
+		return
+	}
+	if err := p.record(audit.KindDecision, map[string]any{
+		"tool":     result.Tool,
+		"decision": string(result.Decision),
+		"rule_id":  result.RuleID,
+		"reason":   result.Reason,
+	}); err != nil {
+		auditFailed(w)
 		return
 	}
 
@@ -148,6 +190,22 @@ func (p *Proxy) handleApproval(w http.ResponseWriter, r *http.Request, body []by
 	if outcome.RequestID != "" {
 		w.Header().Set(HeaderRequestID, outcome.RequestID)
 	}
+	if err := p.record(audit.KindApprovalRequest, map[string]any{
+		"request_id": outcome.RequestID,
+		"tool":       result.Tool,
+		"rule_id":    result.RuleID,
+	}); err != nil {
+		auditFailed(w)
+		return
+	}
+	if err := p.record(audit.KindApprovalResult, map[string]any{
+		"request_id": outcome.RequestID,
+		"approved":   outcome.Approved,
+		"reason":     outcome.Reason,
+	}); err != nil {
+		auditFailed(w)
+		return
+	}
 	if !outcome.Approved {
 		log.Printf("approval request_id=%s tool=%s approved=false reason=%s", outcome.RequestID, result.Tool, outcome.Reason)
 		w.Header().Set(HeaderDecision, string(rules.Deny))
@@ -177,6 +235,10 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, res
 	resp, err := p.client.Do(req)
 	if err != nil {
 		log.Printf("upstream error=%v", err)
+		if err := p.record(audit.KindForward, map[string]any{"target": "upstream", "status": 0, "bytes": 0}); err != nil {
+			auditFailed(w)
+			return
+		}
 		writeError(w, http.StatusBadGateway, "upstream request failed")
 		return
 	}
@@ -198,11 +260,39 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, res
 	if ct == "" {
 		ct = "application/octet-stream"
 	}
+	if err := p.record(audit.KindForward, map[string]any{
+		"target": "upstream",
+		"status": resp.StatusCode,
+		"bytes":  len(upstreamBody),
+	}); err != nil {
+		auditFailed(w)
+		return
+	}
 	w.Header().Set("Content-Type", ct)
 	w.Header().Set(HeaderDecision, string(rules.Allow))
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(upstreamBody)
 	log.Printf("decision tool=%s decision=%s forwarded=true upstream_status=%d", result.Tool, rules.Allow, resp.StatusCode)
+}
+
+func (p *Proxy) record(kind string, payload any) error {
+	if p.audit == nil {
+		return nil
+	}
+	if err := p.audit.Append(kind, payload); err != nil {
+		log.Printf("audit error=%v", err)
+		return err
+	}
+	return nil
+}
+
+func auditFailed(w http.ResponseWriter) {
+	writeError(w, http.StatusInternalServerError, "audit log failed")
+}
+
+func bodyHash(body []byte) string {
+	sum := sha256.Sum256(body)
+	return hex.EncodeToString(sum[:])
 }
 
 func readBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {

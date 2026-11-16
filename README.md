@@ -4,7 +4,7 @@ Deterministic guardrail for financial AI agents. An agent sends a tool call as J
 
 The calls in view are ones that move money, read a balance, or change a stored record. The proxy does not authenticate the caller and does not replace the upstream API's own authorization. It stops malformed calls, and it applies the rules in the policy file, before anything is forwarded.
 
-This tree has the schema, the rule engine, a human approval webhook, and PII redaction on the path to an LLM. Later milestones add a signed hash-chained audit log and a demo agent.
+This tree has the schema, the rule engine, a human approval webhook, PII redaction on the path to an LLM, and a signed hash-chained audit log. A later milestone adds a demo agent.
 
 ## Policy
 
@@ -99,13 +99,30 @@ curl -sS -D- http://127.0.0.1:8080/v1/llm \
 
 The model sees `[EMAIL_1]`. The curl response has `ada@example.com` again. `X-Guardrail-Redacted` counts kinds, not values.
 
+## Audit log
+
+With `-audit-log` and `-audit-key`, every tool call, schema result, rule decision, approval request, approval answer, LLM redaction, and forward is an append-only JSON line. Each line stores the SHA-256 of the previous line and an Ed25519 signature over its own contents. Changing, deleting, reordering, or inserting a line breaks the chain. A signed tip file next to the log (`audit.jsonl.tip`) records the last sequence number, so chopping lines off the end is visible too.
+
+The private key is created on the machine that writes the log. It is not part of this repo.
+
+```bash
+go run ./cmd/audit keygen -out audit.key
+go run ./cmd/proxy -config policy.json \
+  -upstream http://127.0.0.1:8081/ \
+  -audit-log audit.jsonl -audit-key audit.key \
+  -listen 127.0.0.1:8080
+go run ./cmd/audit verify -log audit.jsonl -pub audit.pub
+```
+
+`verify` checks the chain with the public key and prints the first bad entry. Restarting the proxy resumes from the last signed line. Tool calls are stored as a SHA-256 of the raw body, not the body itself. LLM events store redaction counts by type and do not store the text or the placeholder map.
+
 ## Tests
 
 ```bash
 go test ./...
 go vet ./...
 go test -race ./...
-go test ./internal/check ./internal/approval ./internal/proxy ./internal/redact -bench=. -benchmem
+go test ./internal/check ./internal/approval ./internal/proxy ./internal/redact ./internal/audit -bench=. -benchmem
 ```
 
 ## Layout
@@ -121,6 +138,7 @@ go test ./internal/check ./internal/approval ./internal/proxy ./internal/redact 
 - `internal/fakeupstream` is the stand-in API.
 - `internal/fakeapprover` is the stand-in webhook.
 - `internal/fakellm` is the stand-in model.
+- `internal/audit` is the hash-chained log. `cmd/audit` generates a key and verifies a log.
 
 ## License
 
