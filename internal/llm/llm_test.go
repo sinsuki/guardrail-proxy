@@ -4,9 +4,12 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/sinsuki/guardrail-proxy/internal/audit"
 	"github.com/sinsuki/guardrail-proxy/internal/fakellm"
 	"github.com/sinsuki/guardrail-proxy/internal/llm"
 )
@@ -99,6 +102,53 @@ func TestLLMDoesNotFlagBadLuhn(t *testing.T) {
 	}
 	if rec.Header().Get(llm.HeaderRedacted) != "none" {
 		t.Fatal(rec.Header().Get(llm.HeaderRedacted))
+	}
+}
+
+func TestRedactionAuditOmitsValues(t *testing.T) {
+	up := httptest.NewServer(fakellm.Handler())
+	t.Cleanup(up.Close)
+	dir := t.TempDir()
+	privPath := filepath.Join(dir, "audit.key")
+	pubPath := filepath.Join(dir, "audit.pub")
+	if err := audit.GenerateKey(privPath, pubPath); err != nil {
+		t.Fatal(err)
+	}
+	priv, err := audit.LoadPrivate(privPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(dir, "audit.jsonl")
+	l, err := audit.Open(logPath, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy, err := llm.New(up.URL, nil, llm.WithAudit(l))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/llm", strings.NewReader(`{"prompt":"email ada@example.com"}`))
+	proxy.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d %s", rec.Code, rec.Body.String())
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	n, err := audit.Verify(logPath, pubPath)
+	if err != nil || n != 2 {
+		t.Fatalf("verify n=%d err=%v", n, err)
+	}
+	raw, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "ada@example.com") || strings.Contains(string(raw), "[EMAIL_1]") {
+		t.Fatalf("log leaked prompt data: %s", raw)
+	}
+	if !strings.Contains(string(raw), `"email":1`) {
+		t.Fatalf("counts missing: %s", raw)
 	}
 }
 

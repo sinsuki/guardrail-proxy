@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sinsuki/guardrail-proxy/internal/audit"
 	"github.com/sinsuki/guardrail-proxy/internal/redact"
 )
 
@@ -24,14 +25,28 @@ const (
 	HeaderRedacted = "X-Guardrail-Redacted"
 )
 
+// Auditor records one audit event.
+type Auditor interface {
+	Append(kind string, payload any) error
+}
+
 // Proxy forwards redacted prompts to an LLM URL.
 type Proxy struct {
 	upstream *url.URL
 	client   *http.Client
+	audit    Auditor
+}
+
+// Option configures the LLM proxy.
+type Option func(*Proxy)
+
+// WithAudit records redaction counts and the forward. Counts only, never values.
+func WithAudit(a Auditor) Option {
+	return func(p *Proxy) { p.audit = a }
 }
 
 // New builds a proxy. client may be nil.
-func New(upstream string, client *http.Client) (*Proxy, error) {
+func New(upstream string, client *http.Client, opts ...Option) (*Proxy, error) {
 	u, err := url.Parse(upstream)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return nil, fmt.Errorf("llm url must be an absolute http or https URL")
@@ -39,7 +54,11 @@ func New(upstream string, client *http.Client) (*Proxy, error) {
 	if client == nil {
 		client = &http.Client{Timeout: 60 * time.Second}
 	}
-	return &Proxy{upstream: u, client: client}, nil
+	p := &Proxy{upstream: u, client: client}
+	for _, opt := range opts {
+		opt(p)
+	}
+	return p, nil
 }
 
 // Handler serves POST /v1/llm.
@@ -70,6 +89,10 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set(HeaderRedacted, formatCounts(vault))
+	if err := p.record(audit.KindRedaction, countPayload(vault)); err != nil {
+		writeErr(w, http.StatusInternalServerError, "audit log failed")
+		return
+	}
 
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, p.upstream.String(), bytes.NewReader(outbound))
 	if err != nil {
@@ -89,6 +112,14 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, "llm response failed")
 		return
 	}
+	if err := p.record(audit.KindForward, map[string]any{
+		"target": "llm",
+		"status": resp.StatusCode,
+		"bytes":  len(respBody),
+	}); err != nil {
+		writeErr(w, http.StatusInternalServerError, "audit log failed")
+		return
+	}
 	restored := []byte(vault.Restore(string(respBody)))
 	ct := resp.Header.Get("Content-Type")
 	if ct == "" {
@@ -98,6 +129,26 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(restored)
 	log.Printf("llm redacted=%s status=%d", formatCounts(vault), resp.StatusCode)
+}
+
+func (p *Proxy) record(kind string, payload any) error {
+	if p.audit == nil {
+		return nil
+	}
+	if err := p.audit.Append(kind, payload); err != nil {
+		log.Printf("audit error=%v", err)
+		return err
+	}
+	return nil
+}
+
+func countPayload(v *redact.Vault) map[string]int {
+	counts := v.Counts()
+	out := make(map[string]int, len(counts))
+	for k, n := range counts {
+		out[strings.ToLower(string(k))] = n
+	}
+	return out
 }
 
 func redactBody(body []byte) ([]byte, *redact.Vault, string, error) {
